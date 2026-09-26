@@ -1,0 +1,15 @@
+[Unit]
+Description=TUNA display bridge (serial <-> Klipper/Moonraker, Wi-Fi)
+After=moonraker.service NetworkManager.service
+Wants=moonraker.service
+
+[Service]
+# Replace "pi" with your Pi user name (3 places) before installing.
+User=pi
+ExecStart=/usr/bin/python3 /home/pi/tuna_bridge/tuna_bridge.py
+WorkingDirectory=/home/pi/tuna_bridge
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -23,10 +23,13 @@ LV_IMG_DECLARE(img_tuna_logo);
 LV_IMG_DECLARE(img_cambrian_logo);
 LV_IMG_DECLARE(img_icon_protocol);
 
-// The Pi does not report run progress yet, so the run screen simulates it.
-// Set to 0 once real progress messages exist.
-#define DEMO_RUN_SIMULATION 1
+// With no Pi bridge connected, Start run plays a simulated run so the UI can
+// be tried standalone. With the bridge, Klipper drives the run screen.
 #define DEMO_STEP_SECONDS   30
+#define PI_TIMEOUT_MS       15000  // bridge sends Wi-Fi status every 5 s
+// Serial is also the Pi link, so debug echo would go to the Pi. Keep 0 unless
+// RPI_SERIAL is moved to a UART.
+#define DEBUG_SERIAL_ECHO   0
 
 // ----------------------------- CONFIG -----------------------------
 #define RPI_SERIAL         Serial
@@ -97,12 +100,36 @@ static char protoNames[MAX_PROTOCOLS][64];
 static int protoCount = 0;
 static char selectedName[64] = "";
 
-#define STEP_COUNT 4
-static const char *STEP_NAMES[STEP_COUNT] = {"Binding", "Wash 1", "Wash 2", "Elution"};
-static const uint32_t RUN_TOTAL_S = STEP_COUNT * DEMO_STEP_SECONDS;
-static bool running = false;
+#define STEP_MAX 6
+static const char *DEMO_STEPS[] = {"Binding", "Wash 1", "Wash 2", "Elution"};
+static char stepNames[STEP_MAX][24];
+static int stepCount = 0;        // 0 = no step info, show one overall bar
+static int curStep = 1;          // 1-based
+static int curStepPct = 50;      // fill of the current step's bar
+static char runDesc[128] = "";
+static uint32_t runTotalS = 0;   // 0 = unknown, show elapsed instead of countdown
 static uint32_t runElapsedS = 0;
+static bool running = false;
+static bool demoRun = false;
 static lv_timer_t *runTimer = nullptr;
+static lv_timer_t *runStartTimeout = nullptr;  // "did the controller ever ack Start run?"
+
+static uint32_t lastPiMsgMs = 0;
+static bool wifiUp = false;
+static char wifiSsid[40] = "";
+static int wifiSignal = 0;
+static char wifiIp[20] = "";
+
+#define MAX_WIFI_NETS 20
+struct WifiNet { char ssid[40]; int signal; bool secure; };
+static WifiNet wifiNets[MAX_WIFI_NETS];
+static int wifiNetCount = 0;
+static bool wifiScanPending = false;
+static char wifiConnectSsid[40] = "";
+static lv_obj_t *scrWifi, *scrWifiPass;
+static lv_obj_t *wifiListBox, *lblWifiCurText, *taWifiPass, *lblWifiPassTitle;
+static lv_obj_t *wifiConnOverlay = nullptr;
+static lv_timer_t *wifiConnTimeout = nullptr;
 
 static char rxLine[768];
 static size_t rxPos = 0;
@@ -110,16 +137,28 @@ static uint32_t lastTick = 0;
 
 // ----------------------------- UI handles -------------------------
 static lv_obj_t *scrLoading, *scrHome, *scrList, *scrDetail, *scrRun;
-static lv_obj_t *listBox, *lblDetailTitle;
-static lv_obj_t *lblRunTitle, *lblTimer, *lblStepCount;
-static lv_obj_t *stepBars[STEP_COUNT], *stepLabels[STEP_COUNT];
+static lv_obj_t *listBox, *lblDetailTitle, *lblWifiIcon;
+static lv_obj_t *lblRunTitle, *lblRunDesc, *lblTimerCap, *lblTimer, *lblStepCount;
+static lv_obj_t *stepBars[STEP_MAX], *stepDots[STEP_MAX], *stepLabels[STEP_MAX];
 
 // ----------------------------- Helpers ----------------------------
 static void sendLine(const char *line) {
   RPI_SERIAL.print(line);
   RPI_SERIAL.print("\n");
+#if DEBUG_SERIAL_ECHO
   Serial.print(">> ");
   Serial.println(line);
+#endif
+}
+
+static bool pi_connected() { return lastPiMsgMs && millis() - lastPiMsgMs < PI_TIMEOUT_MS; }
+
+// "rgb_01_solid_colors.gcode" -> "rgb_01_solid_colors"
+static void display_name(char *dst, size_t n, const char *file) {
+  strncpy(dst, file, n - 1);
+  dst[n - 1] = 0;
+  size_t len = strlen(dst);
+  if (len > 6 && strcasecmp(dst + len - 6, ".gcode") == 0) dst[len - 6] = 0;
 }
 
 static lv_color_t C(uint32_t hex) { return lv_color_hex(hex); }
@@ -182,12 +221,13 @@ static lv_obj_t *button(lv_obj_t *parent, int x, int y, int w, int h, const char
   return b;
 }
 
-static lv_obj_t *circle_button(lv_obj_t *parent, int x, int y, const char *txt, lv_event_cb_t cb) {
-  lv_obj_t *b = box(parent, x, y, 30, 30);
+static lv_obj_t *circle_button(lv_obj_t *parent, int x, int y, const char *txt, lv_event_cb_t cb,
+                               int d = 30, const lv_font_t *f = F14) {
+  lv_obj_t *b = box(parent, x, y, d, d);
   fill(b, COL_CARD, LV_RADIUS_CIRCLE);
   outline(b, COL_EDGE, 1);
   if (cb) make_clickable(b, cb, nullptr);
-  lv_obj_center(label(b, txt, F14, COL_TEXT));
+  lv_obj_center(label(b, txt, f, COL_TEXT));
   return b;
 }
 
@@ -481,18 +521,34 @@ static void createLoadingScreen() {
 }
 
 // ----------------------------- Home screen --------------------------
+// Defined later, in the Wi-Fi screens section; forward-declared so the
+// Home screen's icon can jump straight to a live scan.
+static void wifi_screen_refresh_current();
+static void wifi_refresh_cb(lv_event_t *e);
+
 static void help_btn_cb(lv_event_t *e) { show_help_menu(); }
 static void choose_protocol_cb(lv_event_t *e) { lv_scr_load(scrList); }
+
+static void wifi_btn_cb(lv_event_t *e) {
+  lv_scr_load(scrWifi);
+  wifi_screen_refresh_current();
+  wifi_refresh_cb(nullptr);
+}
+
+static void link_check_cb(lv_timer_t *t) {
+  lv_obj_set_style_text_color(lblWifiIcon, C(pi_connected() && wifiUp ? COL_TEXT : COL_EDGE), 0);
+}
 
 static void createHomeScreen() {
   scrHome = new_screen();
 
   lv_obj_t *brand = lv_img_create(scrHome);
   lv_img_set_src(brand, &img_cambrian_logo);
-  lv_obj_set_pos(brand, 16, 16);
+  lv_obj_set_pos(brand, 16, 12);
 
-  circle_button(scrHome, 400, 13, LV_SYMBOL_WIFI, nullptr);
-  circle_button(scrHome, 438, 13, "?", help_btn_cb);
+  lblWifiIcon = lv_obj_get_child(circle_button(scrHome, 374, 7, LV_SYMBOL_WIFI, wifi_btn_cb, 42, F18), 0);
+  lv_timer_create(link_check_cb, 1000, nullptr);
+  circle_button(scrHome, 424, 7, "?", help_btn_cb, 42, F18);
   hline(scrHome, 0, 56, W);
 
   lv_obj_align(label(scrHome, "Start a new run", F14, COL_MUTED), LV_ALIGN_TOP_MID, 0, 86);
@@ -515,18 +571,24 @@ static void open_detail(int idx);
 static void proto_row_cb(lv_event_t *e) { open_detail((int)(intptr_t)lv_event_get_user_data(e)); }
 static void list_back_cb(lv_event_t *e) { goHome(); }
 
+// Rows are tall enough for small fingers, and sized so exactly 4 fit in the
+// list area at once; the rest scroll (a sliver of row 5 peeks in as a hint).
+static const int PROTO_ROW_H = 60;
+
 static void build_protocol_rows() {
   lv_obj_clean(listBox);
   if (protoCount == 0) {
     lv_obj_set_pos(label(listBox, "No protocols found", F14, COL_MUTED), 35, 12);
     return;
   }
+  char name[64];
   for (int i = 0; i < protoCount; i++) {
-    lv_obj_t *row = box(listBox, 0, i * 34, W, 34);
+    lv_obj_t *row = box(listBox, 0, i * PROTO_ROW_H, W, PROTO_ROW_H);
     make_clickable(row, proto_row_cb, (void *)(intptr_t)i);
-    lv_obj_align(label(row, protoNames[i], F14, COL_TEXT), LV_ALIGN_LEFT_MID, 35, 0);
+    display_name(name, sizeof(name), protoNames[i]);
+    lv_obj_align(label(row, name, F16, COL_TEXT), LV_ALIGN_LEFT_MID, 35, 0);
     lv_obj_align(label(row, LV_SYMBOL_RIGHT, F14, COL_TEXT), LV_ALIGN_RIGHT_MID, -24, 0);
-    hline(row, 0, 33, W);
+    hline(row, 0, PROTO_ROW_H - 1, W);
   }
 }
 
@@ -537,6 +599,267 @@ static void createListScreen() {
   lv_obj_add_flag(listBox, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_scroll_dir(listBox, LV_DIR_VER);
   build_protocol_rows();
+}
+
+// ----------------------------- Wi-Fi screens -------------------------
+// Forward declarations: used as callbacks/by each other before their own
+// definition further down (Arduino's auto-prototyping is unreliable for
+// this pattern elsewhere in the file, so we're explicit, as above).
+static void begin_wifi_connect(const char *ssid, const char *password);
+static void wifi_net_row_cb(lv_event_t *e);
+
+static void pct_decode(char *s);  // defined with the serial parsing, below
+
+// Mirrors pct_decode(): percent-encodes text we send TO the Pi (SSID,
+// password) so a literal | ; or space in either can't break the line format.
+static void pct_encode(const char *src, char *dst, size_t dstsz) {
+  size_t o = 0;
+  for (const unsigned char *p = (const unsigned char *)src; *p && o + 4 < dstsz; p++) {
+    if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~') {
+      dst[o++] = (char)*p;
+    } else {
+      snprintf(dst + o, dstsz - o, "%%%02X", *p);
+      o += 3;
+    }
+  }
+  dst[o] = 0;
+}
+
+static void wifi_screen_refresh_current() {
+  char buf[100];
+  if (!pi_connected()) {
+    strcpy(buf, "Controller not connected");
+  } else if (wifiUp) {
+    snprintf(buf, sizeof(buf), "Connected: %s\n%s   %d%%", wifiSsid, wifiIp, wifiSignal);
+  } else {
+    strcpy(buf, "Not connected to a network");
+  }
+  lv_label_set_text(lblWifiCurText, buf);
+}
+
+static void wifi_rows_show_message(const char *msg) {
+  lv_obj_clean(wifiListBox);
+  lv_obj_set_pos(label(wifiListBox, msg, F14, COL_MUTED), 20, 14);
+}
+
+static void rebuild_wifi_rows() {
+  lv_obj_clean(wifiListBox);
+  if (wifiNetCount == 0) {
+    wifi_rows_show_message("No networks found.");
+    return;
+  }
+  const int ROW_H = 56;
+  char sub[32];
+  for (int i = 0; i < wifiNetCount; i++) {
+    lv_obj_t *row = box(wifiListBox, 0, i * ROW_H, W, ROW_H);
+    make_clickable(row, wifi_net_row_cb, (void *)(intptr_t)i);
+    lv_obj_align(label(row, wifiNets[i].ssid, F16, COL_TEXT), LV_ALIGN_TOP_LEFT, 20, 8);
+    snprintf(sub, sizeof(sub), "%s   %d%%", wifiNets[i].secure ? "Secured" : "Open", wifiNets[i].signal);
+    lv_obj_align(label(row, sub, F12, COL_MUTED), LV_ALIGN_BOTTOM_LEFT, 20, -8);
+    lv_obj_align(label(row, LV_SYMBOL_RIGHT, F14, COL_TEXT), LV_ALIGN_RIGHT_MID, -20, 0);
+    hline(row, 0, ROW_H - 1, W);
+  }
+}
+
+static void wifi_scan_timeout_cb(lv_timer_t *t) {
+  if (wifiScanPending) {
+    wifiScanPending = false;
+    wifi_rows_show_message("No response from the controller.");
+  }
+}
+
+static void wifi_refresh_cb(lv_event_t *e) {
+  if (!pi_connected()) {
+    wifi_rows_show_message("Controller not connected.\nCheck the USB cable to the Raspberry Pi.");
+    return;
+  }
+  wifiScanPending = true;
+  wifi_rows_show_message("Scanning...");
+  sendLine("CMD|WIFI_SCAN");
+  lv_timer_t *t = lv_timer_create(wifi_scan_timeout_cb, 6000, nullptr);
+  lv_timer_set_repeat_count(t, 1);
+}
+
+static void wifi_list_back_cb(lv_event_t *e) { goHome(); }
+
+static void createWifiScreen() {
+  scrWifi = new_screen();
+  back_header(scrWifi, "Wi-Fi", wifi_list_back_cb);
+  circle_button(scrWifi, 430, 14, LV_SYMBOL_REFRESH, wifi_refresh_cb);
+
+  lv_obj_t *cur = card(scrWifi, 20, 72, 440, 46);
+  lblWifiCurText = label(cur, "", F14, COL_TEXT);
+  lv_obj_set_style_text_line_space(lblWifiCurText, 2, 0);
+  lv_obj_align(lblWifiCurText, LV_ALIGN_LEFT_MID, 4, 0);
+
+  lv_obj_align(label(scrWifi, "Available networks", F14, COL_MUTED), LV_ALIGN_TOP_LEFT, 22, 128);
+
+  wifiListBox = box(scrWifi, 0, 152, W, H - 152);
+  lv_obj_add_flag(wifiListBox, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(wifiListBox, LV_DIR_VER);
+}
+
+// --- Password entry (secured networks) --------------------------------
+static void toggle_pw_visibility_cb(lv_event_t *e) {
+  bool was_hidden = lv_textarea_get_password_mode(taWifiPass);
+  lv_textarea_set_password_mode(taWifiPass, !was_hidden);
+  lv_obj_t *icon_lbl = lv_obj_get_child(lv_event_get_current_target(e), 0);
+  lv_label_set_text(icon_lbl, was_hidden ? LV_SYMBOL_EYE_OPEN : LV_SYMBOL_EYE_CLOSE);
+}
+
+static void wifi_pass_back_cb(lv_event_t *e) { lv_scr_load(scrWifi); }
+
+static void wifi_pass_kb_cb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY) {
+    begin_wifi_connect(wifiConnectSsid, lv_textarea_get_text(taWifiPass));
+    lv_scr_load(scrWifi);
+  } else if (code == LV_EVENT_CANCEL) {
+    lv_scr_load(scrWifi);
+  }
+}
+
+static void createWifiPasswordScreen() {
+  scrWifiPass = new_screen();
+
+  // Compact header (not back_header's usual 60px) - the keyboard needs
+  // every spare pixel of height on a 320-tall screen.
+  lv_obj_t *back = box(scrWifiPass, 0, 0, 200, 28);
+  make_clickable(back, wifi_pass_back_cb, nullptr);
+  lv_obj_set_pos(label(back, LV_SYMBOL_LEFT, F14, COL_TEXT), 10, 5);
+  lblWifiPassTitle = label(back, "Network", F14, COL_TEXT);
+  lv_obj_set_pos(lblWifiPassTitle, 34, 5);
+
+  taWifiPass = lv_textarea_create(scrWifiPass);
+  lv_textarea_set_one_line(taWifiPass, true);
+  lv_textarea_set_password_mode(taWifiPass, true);
+  lv_textarea_set_placeholder_text(taWifiPass, "Password");
+  lv_obj_set_pos(taWifiPass, 12, 30);
+  lv_obj_set_size(taWifiPass, 336, 34);
+
+  circle_button(scrWifiPass, 356, 30, LV_SYMBOL_EYE_CLOSE, toggle_pw_visibility_cb, 34, F14);
+
+  // Full-width, nearly the whole rest of the screen. The default theme's
+  // per-key minimum height (meant for bigger displays) is taller than a
+  // 5-row keyboard can fit here, so rows beyond what fits at that minimum
+  // were simply not drawn - min_height=0 lets keys shrink to fit instead.
+  const int KB_Y = 68;
+  lv_obj_t *kb = lv_keyboard_create(scrWifiPass);
+  lv_keyboard_set_textarea(kb, taWifiPass);
+  lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+  lv_obj_set_style_min_height(kb, 0, LV_PART_ITEMS);
+  lv_obj_set_style_min_width(kb, 0, LV_PART_ITEMS);
+  lv_obj_set_style_pad_all(kb, 2, 0);
+  lv_obj_set_style_pad_row(kb, 2, 0);
+  lv_obj_set_style_pad_column(kb, 2, 0);
+  lv_obj_set_style_text_font(kb, F12, LV_PART_ITEMS);
+  lv_obj_set_pos(kb, 0, KB_Y);
+  lv_obj_set_size(kb, W, H - KB_Y);
+
+  // Dark-theme the keys (default is the light theme's white key look, which
+  // barely showed against our black screens) and give pressed/held keys a
+  // clearly different color so taps have visible feedback.
+  lv_obj_set_style_bg_opa(kb, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(kb, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(kb, 6, LV_PART_ITEMS);
+  lv_obj_set_style_bg_color(kb, C(COL_CARD_HI), LV_PART_ITEMS);
+  lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, LV_PART_ITEMS);
+  lv_obj_set_style_text_color(kb, C(COL_TEXT), LV_PART_ITEMS);
+  lv_obj_set_style_border_width(kb, 1, LV_PART_ITEMS);
+  lv_obj_set_style_border_color(kb, C(COL_EDGE), LV_PART_ITEMS);
+  lv_obj_set_style_bg_color(kb, C(COL_ACCENT), LV_PART_ITEMS | LV_STATE_PRESSED);
+  lv_obj_set_style_bg_color(kb, C(COL_ACCENT), LV_PART_ITEMS | LV_STATE_CHECKED);
+
+  // LVGL's keyboard sends READY/CANCEL to the bound textarea, not to the
+  // keyboard widget itself - that's why Enter did nothing before.
+  lv_obj_add_event_cb(taWifiPass, wifi_pass_kb_cb, LV_EVENT_READY, nullptr);
+  lv_obj_add_event_cb(taWifiPass, wifi_pass_kb_cb, LV_EVENT_CANCEL, nullptr);
+}
+
+static void wifi_net_row_cb(lv_event_t *e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx < 0 || idx >= wifiNetCount) return;
+  strncpy(wifiConnectSsid, wifiNets[idx].ssid, sizeof(wifiConnectSsid) - 1);
+  wifiConnectSsid[sizeof(wifiConnectSsid) - 1] = 0;
+  if (wifiNets[idx].secure) {
+    lv_label_set_text(lblWifiPassTitle, wifiConnectSsid);
+    lv_textarea_set_text(taWifiPass, "");
+    lv_scr_load(scrWifiPass);
+  } else {
+    begin_wifi_connect(wifiConnectSsid, "");
+  }
+}
+
+// --- Connecting ---------------------------------------------------------
+static void wifi_connect_timeout_cb(lv_timer_t *t) {
+  wifiConnTimeout = nullptr;
+  if (wifiConnOverlay) {
+    lv_obj_del(wifiConnOverlay);
+    wifiConnOverlay = nullptr;
+    show_message("Wi-Fi", "No response from the controller.");
+  }
+}
+
+static void begin_wifi_connect(const char *ssid, const char *password) {
+  char encSsid[100], encPw[200], cmd[320];
+  pct_encode(ssid, encSsid, sizeof(encSsid));
+  pct_encode(password, encPw, sizeof(encPw));
+  snprintf(cmd, sizeof(cmd), "CMD|WIFI_CONNECT|%s|%s", encSsid, encPw);
+  sendLine(cmd);
+  strncpy(wifiConnectSsid, ssid, sizeof(wifiConnectSsid) - 1);
+  wifiConnectSsid[sizeof(wifiConnectSsid) - 1] = 0;
+
+  if (wifiConnOverlay) lv_obj_del(wifiConnOverlay);
+  wifiConnOverlay = overlay_create();
+  lv_obj_t *c = modal_card(wifiConnOverlay, 0, 0, 260, 150);
+  lv_obj_center(c);
+  lv_obj_t *sp = lv_spinner_create(c, 1000, 60);
+  lv_obj_set_size(sp, 40, 40);
+  lv_obj_align(sp, LV_ALIGN_TOP_MID, 0, 22);
+  lv_obj_set_style_arc_color(sp, C(COL_ACCENT), LV_PART_INDICATOR);
+  char msg[80];
+  snprintf(msg, sizeof(msg), "Connecting to\n%s", ssid);
+  lv_obj_t *l = label(c, msg, F14, COL_TEXT);
+  lv_obj_set_width(l, 220);
+  lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(l, LV_ALIGN_BOTTOM_MID, 0, -20);
+
+  if (wifiConnTimeout) lv_timer_del(wifiConnTimeout);
+  wifiConnTimeout = lv_timer_create(wifi_connect_timeout_cb, 30000, nullptr);
+  lv_timer_set_repeat_count(wifiConnTimeout, 1);
+}
+
+// Called from the serial parser below on OK|WIFI... or ERR|WIFI|...
+static void on_wifi_result(bool ok, const char *detail) {
+  if (wifiConnTimeout) { lv_timer_del(wifiConnTimeout); wifiConnTimeout = nullptr; }
+  if (wifiConnOverlay) { lv_obj_del(wifiConnOverlay); wifiConnOverlay = nullptr; }
+  char msg[110];
+  if (ok) snprintf(msg, sizeof(msg), "Connected to %s%s%s", wifiConnectSsid, (detail && detail[0]) ? "\n" : "", detail ? detail : "");
+  else snprintf(msg, sizeof(msg), "%s", (detail && detail[0]) ? detail : "Connection failed.");
+  show_message(ok ? "Wi-Fi connected" : "Wi-Fi", msg);
+  wifi_screen_refresh_current();
+}
+
+// WIFI_LIST|ssid,signal,secure;ssid2,signal2,secure2;...
+static void on_wifi_list(char *payload) {
+  wifiScanPending = false;
+  wifiNetCount = 0;
+  for (char *ent = strtok(payload, ";"); ent && wifiNetCount < MAX_WIFI_NETS; ent = strtok(nullptr, ";")) {
+    char *parts[3];
+    int pn = 0;
+    parts[pn++] = ent;
+    for (char *p = ent; *p && pn < 3; p++) {
+      if (*p == ',') { *p = 0; parts[pn++] = p + 1; }
+    }
+    if (pn < 3) continue;
+    pct_decode(parts[0]);
+    WifiNet &n = wifiNets[wifiNetCount++];
+    strncpy(n.ssid, parts[0], sizeof(n.ssid) - 1);
+    n.ssid[sizeof(n.ssid) - 1] = 0;
+    n.signal = atoi(parts[1]);
+    n.secure = atoi(parts[2]) != 0;
+  }
+  rebuild_wifi_rows();
 }
 
 // ----------------------------- Protocol detail ----------------------
@@ -622,39 +945,111 @@ static void open_detail(int idx) {
   if (idx < 0 || idx >= protoCount) return;
   strncpy(selectedName, protoNames[idx], sizeof(selectedName) - 1);
   selectedName[sizeof(selectedName) - 1] = 0;
-  lv_label_set_text(lblDetailTitle, selectedName);
+  char name[64];
+  display_name(name, sizeof(name), selectedName);
+  lv_label_set_text(lblDetailTitle, name);
   lv_scr_load(scrDetail);
 }
 
 // ----------------------------- Run screen ---------------------------
-static void update_run_ui() {
-  uint32_t remaining = runElapsedS < RUN_TOTAL_S ? RUN_TOTAL_S - runElapsedS : 0;
-  lv_label_set_text_fmt(lblTimer, "%02lu:%02lu", (unsigned long)(remaining / 60), (unsigned long)(remaining % 60));
+// Step area spans x 243..456; bars share it evenly (1..STEP_MAX bars).
+static const int STEPS_X = 243, STEPS_W = 213, STEPS_GAP = 4;
 
-  int step = runElapsedS / DEMO_STEP_SECONDS;
-  if (step >= STEP_COUNT) step = STEP_COUNT - 1;
-  lv_label_set_text_fmt(lblStepCount, "%d of %d", step + 1, STEP_COUNT);
-
-  for (int i = 0; i < STEP_COUNT; i++) {
-    int v = 0;
-    if (runElapsedS >= RUN_TOTAL_S || i < step) v = 100;
-    else if (i == step) v = (runElapsedS - step * DEMO_STEP_SECONDS) * 100 / DEMO_STEP_SECONDS;
-    lv_bar_set_value(stepBars[i], v, LV_ANIM_OFF);
-    lv_obj_set_style_text_color(stepLabels[i], C(i == step ? COL_ACCENT : COL_TEXT), 0);
+static void layout_steps() {
+  int n = stepCount > 0 ? stepCount : 1;
+  int bw = (STEPS_W - (n - 1) * STEPS_GAP) / n;
+  for (int i = 0; i < STEP_MAX; i++) {
+    bool show = i < n;
+    lv_obj_t *objs[] = {stepBars[i], stepDots[i], stepLabels[i]};
+    for (lv_obj_t *o : objs) {
+      if (show) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+      else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (!show) continue;
+    int x = STEPS_X + i * (bw + STEPS_GAP);
+    lv_obj_set_pos(stepBars[i], x, 146);
+    lv_obj_set_width(stepBars[i], bw);
+    lv_obj_set_pos(stepDots[i], x + bw / 2 - 2, 160);
+    lv_label_set_text(stepLabels[i], stepCount > 0 ? stepNames[i] : "");
+    lv_obj_align_to(stepLabels[i], stepBars[i], LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
   }
+  if (stepCount == 0) lv_obj_add_flag(stepDots[0], LV_OBJ_FLAG_HIDDEN);
+}
+
+static void update_run_ui() {
+  bool countdown = runTotalS > 0;
+  uint32_t t = countdown ? (runElapsedS < runTotalS ? runTotalS - runElapsedS : 0) : runElapsedS;
+  lv_label_set_text(lblTimerCap, countdown ? "COMPLETING IN" : "ELAPSED");
+  if (t >= 3600)
+    lv_label_set_text_fmt(lblTimer, "%lu:%02lu:%02lu", (unsigned long)(t / 3600), (unsigned long)(t / 60 % 60), (unsigned long)(t % 60));
+  else
+    lv_label_set_text_fmt(lblTimer, "%02lu:%02lu", (unsigned long)(t / 60), (unsigned long)(t % 60));
+
+  if (stepCount == 0) {
+    lv_label_set_text(lblStepCount, "");
+    lv_bar_set_value(stepBars[0], countdown ? runElapsedS * 100 / runTotalS : 0, LV_ANIM_OFF);
+    return;
+  }
+  int step = curStep < 1 ? 1 : (curStep > stepCount ? stepCount : curStep);
+  lv_label_set_text_fmt(lblStepCount, "%d of %d", step, stepCount);
+  for (int i = 0; i < stepCount; i++) {
+    int v = i < step - 1 ? 100 : (i == step - 1 ? curStepPct : 0);
+    lv_bar_set_value(stepBars[i], v, LV_ANIM_OFF);
+    lv_obj_set_style_text_color(stepLabels[i], C(i == step - 1 ? COL_ACCENT : COL_TEXT), 0);
+    // With many steps the names don't fit; show only the current one.
+    if (stepCount > 4) {
+      if (i == step - 1) lv_obj_clear_flag(stepLabels[i], LV_OBJ_FLAG_HIDDEN);
+      else lv_obj_add_flag(stepLabels[i], LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
+static void set_steps(const char *const *names, int n) {
+  stepCount = n > STEP_MAX ? STEP_MAX : n;
+  for (int i = 0; i < stepCount; i++) {
+    strncpy(stepNames[i], names[i], sizeof(stepNames[0]) - 1);
+    stepNames[i][sizeof(stepNames[0]) - 1] = 0;
+  }
+  layout_steps();
+}
+
+static void show_run_screen(const char *file) {
+  char name[64];
+  display_name(name, sizeof(name), file);
+  lv_label_set_text(lblRunTitle, name);
+  lv_label_set_text(lblRunDesc, runDesc[0] ? runDesc : "No description available.");
+  update_run_ui();
+  if (lv_scr_act() != scrRun) lv_scr_load(scrRun);
 }
 
 static void stop_run() {
   running = false;
+  demoRun = false;
   lv_timer_pause(runTimer);
+  if (runStartTimeout) { lv_timer_del(runStartTimeout); runStartTimeout = nullptr; }
 }
 
+static void finish_run(const char *title, bool ok) {
+  stop_run();
+  show_result(title, ok);
+}
+
+// Standalone demo only (no Pi): fake a 4-step run.
 static void run_tick_cb(lv_timer_t *t) {
   runElapsedS++;
+  curStep = runElapsedS / DEMO_STEP_SECONDS + 1;
+  curStepPct = (runElapsedS % DEMO_STEP_SECONDS) * 100 / DEMO_STEP_SECONDS;
   update_run_ui();
-  if (runElapsedS >= RUN_TOTAL_S) {
-    stop_run();
-    show_result("Run completed", true);
+  if (runElapsedS >= runTotalS) finish_run("Run completed", true);
+}
+
+// If Start run got no RUN|... from the bridge at all within this window,
+// either Klipper never entered "printing" or the bridge/Moonraker link is
+// down - surface that instead of leaving the screen frozen on "Starting...".
+static void run_start_timeout_cb(lv_timer_t *t) {
+  runStartTimeout = nullptr;
+  if (running && !demoRun && runTotalS == 0 && stepCount == 0) {
+    finish_run("Run did not start", false);
   }
 }
 
@@ -663,15 +1058,27 @@ static void start_run_cb(lv_event_t *e) {
   snprintf(cmd, sizeof(cmd), "CMD|PRINT|%s", selectedName);
   sendLine(cmd);
 
-  lv_label_set_text(lblRunTitle, selectedName);
-  runElapsedS = 0;
   running = true;
-  update_run_ui();
-  lv_scr_load(scrRun);
-#if DEMO_RUN_SIMULATION
-  lv_timer_reset(runTimer);
-  lv_timer_resume(runTimer);
-#endif
+  runElapsedS = 0;
+  curStep = 1;
+  curStepPct = 0;
+  demoRun = !pi_connected();
+  if (demoRun) {
+    runTotalS = 4 * DEMO_STEP_SECONDS;
+    strcpy(runDesc, "Demo run - no controller connected.");
+    set_steps(DEMO_STEPS, 4);
+    lv_timer_reset(runTimer);
+    lv_timer_resume(runTimer);
+  } else {
+    // Real values arrive in the bridge's RUN line within a moment.
+    runTotalS = 0;
+    strcpy(runDesc, "Starting...");
+    set_steps(nullptr, 0);
+    if (runStartTimeout) lv_timer_del(runStartTimeout);
+    runStartTimeout = lv_timer_create(run_start_timeout_cb, 8000, nullptr);
+    lv_timer_set_repeat_count(runStartTimeout, 1);
+  }
+  show_run_screen(selectedName);
 }
 
 static void do_cancel_run() {
@@ -695,7 +1102,15 @@ static void estop_cb(lv_event_t *e) {
 }
 
 static void info_cb(lv_event_t *e) {
-  show_message(selectedName, "Steps: Binding, Wash 1, Wash 2, Elution.");
+  char text[200] = "No step information.";
+  if (stepCount > 0) {
+    strcpy(text, "Steps: ");
+    for (int i = 0; i < stepCount; i++) {
+      strncat(text, stepNames[i], sizeof(text) - strlen(text) - 3);
+      if (i < stepCount - 1) strcat(text, ", ");
+    }
+  }
+  show_message(lv_label_get_text(lblRunTitle), text);
 }
 
 static void createRunScreen() {
@@ -704,26 +1119,24 @@ static void createRunScreen() {
   lblRunTitle = label(scrRun, "Protocol", F18, COL_TEXT);
   lv_obj_set_pos(lblRunTitle, 24, 18);
   circle_button(scrRun, 426, 14, "i", info_cb);
-  lv_obj_t *desc = label(scrRun, "No description available.", F12, COL_MUTED);
-  lv_obj_set_width(desc, 390);
-  lv_obj_set_pos(desc, 24, 50);
+  lblRunDesc = label(scrRun, "", F12, COL_MUTED);
+  lv_obj_set_width(lblRunDesc, 390);
+  lv_obj_set_pos(lblRunDesc, 24, 50);
 
   lv_obj_t *tc = card(scrRun, 24, 92, 205, 140);
-  lv_obj_t *cap = label(tc, "COMPLETING IN", F12, COL_MUTED);
-  lv_obj_set_style_text_letter_space(cap, 1, 0);
-  lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 26);
+  lblTimerCap = label(tc, "COMPLETING IN", F12, COL_MUTED);
+  lv_obj_set_style_text_letter_space(lblTimerCap, 1, 0);
+  lv_obj_align(lblTimerCap, LV_ALIGN_TOP_MID, 0, 26);
   lblTimer = label(tc, "00:00", F38, COL_TIMER);
   lv_obj_align(lblTimer, LV_ALIGN_CENTER, 0, 14);
 
-  lv_obj_set_pos(label(scrRun, "Step progress", F14, COL_MUTED), 243, 108);
-  lblStepCount = label(scrRun, "1 of 4", F14, COL_ACCENT);
+  lv_obj_set_pos(label(scrRun, "Step progress", F14, COL_MUTED), STEPS_X, 108);
+  lblStepCount = label(scrRun, "", F14, COL_ACCENT);
   lv_obj_align(lblStepCount, LV_ALIGN_TOP_RIGHT, -24, 108);
 
-  for (int i = 0; i < STEP_COUNT; i++) {
-    int x = 243 + i * 54;
+  for (int i = 0; i < STEP_MAX; i++) {
     lv_obj_t *bar = lv_bar_create(scrRun);
     lv_obj_remove_style_all(bar);
-    lv_obj_set_pos(bar, x, 146);
     lv_obj_set_size(bar, 50, 8);
     lv_obj_set_style_bg_color(bar, C(COL_CARD_HI), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
@@ -734,12 +1147,11 @@ static void createRunScreen() {
     lv_bar_set_range(bar, 0, 100);
     stepBars[i] = bar;
 
-    lv_obj_t *dot = box(scrRun, x + 23, 160, 4, 4);
-    fill(dot, COL_ACCENT, LV_RADIUS_CIRCLE);
-
-    stepLabels[i] = label(scrRun, STEP_NAMES[i], F12, COL_TEXT);
-    lv_obj_align_to(stepLabels[i], bar, LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
+    stepDots[i] = box(scrRun, 0, 160, 4, 4);
+    fill(stepDots[i], COL_ACCENT, LV_RADIUS_CIRCLE);
+    stepLabels[i] = label(scrRun, "", F12, COL_TEXT);
   }
+  set_steps(DEMO_STEPS, 4);
 
   lv_obj_t *cancel = button(scrRun, 24, 248, 205, 48, "Cancel", COL_CARD, F16, cancel_cb, nullptr);
   outline(cancel, COL_EDGE, 1);
@@ -793,18 +1205,122 @@ static void setProtocolsFromFiles(const char *files) {
   build_protocol_rows();
 }
 
-static void onLineFromPi(const char *line) {
-  Serial.print("<< ");
-  Serial.println(line);
-
-  if (strncmp(line, "FILES|", 6) == 0) {
-    setProtocolsFromFiles(line + 6);
-  } else if (strncmp(line, "ERR|", 4) == 0) {
-    if (running) {
-      stop_run();
-      show_result("Run failed", false);
+// Splits on '|' in place, keeping empty fields.
+static int split_fields(char *s, char **out, int max) {
+  int n = 0;
+  out[n++] = s;
+  for (; *s && n < max; s++) {
+    if (*s == '|') {
+      *s = 0;
+      out[n++] = s + 1;
     }
   }
+  return n;
+}
+
+// Undo the bridge's percent-encoding (%7C -> |) in place.
+static void pct_decode(char *s) {
+  char *o = s;
+  while (*s) {
+    if (s[0] == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
+      char hex[3] = {s[1], s[2], 0};
+      *o++ = (char)strtol(hex, nullptr, 16);
+      s += 3;
+    } else {
+      *o++ = *s++;
+    }
+  }
+  *o = 0;
+}
+
+// RUN|file|total_s|step1;step2;...|description
+static void on_run(char **f, int n) {
+  if (n < 3) return;
+  strncpy(selectedName, f[1], sizeof(selectedName) - 1);
+  runTotalS = strtoul(f[2], nullptr, 10);
+  runDesc[0] = 0;
+  if (n > 4) {
+    pct_decode(f[4]);
+    strncpy(runDesc, f[4], sizeof(runDesc) - 1);
+  }
+  const char *names[STEP_MAX];
+  int count = 0;
+  if (n > 3 && f[3][0]) {
+    for (char *p = strtok(f[3], ";"); p && count < STEP_MAX; p = strtok(nullptr, ";")) {
+      pct_decode(p);
+      names[count++] = p;
+    }
+  }
+  set_steps(names, count);
+
+  if (runStartTimeout) { lv_timer_del(runStartTimeout); runStartTimeout = nullptr; }
+  if (demoRun) lv_timer_pause(runTimer);
+  demoRun = false;
+  running = true;
+  runElapsedS = 0;
+  curStep = 1;
+  curStepPct = 50;
+  show_run_screen(selectedName);
+}
+
+// STATUS|state|elapsed_s|step
+static void on_status(char **f, int n) {
+  if (!running || demoRun || n < 3) return;
+  const char *state = f[1];
+  runElapsedS = strtoul(f[2], nullptr, 10);
+  if (n > 3 && atoi(f[3]) > 0) curStep = atoi(f[3]);
+
+  if (!strcmp(state, "printing") || !strcmp(state, "paused")) update_run_ui();
+  else if (!strcmp(state, "complete")) finish_run("Run completed", true);
+  else if (!strcmp(state, "cancelled")) finish_run("Run cancelled", false);
+  else if (!strcmp(state, "error")) finish_run("Run failed", false);
+}
+
+// WIFI|1|ssid|signal|ip   or   WIFI|0
+static void on_wifi(char **f, int n) {
+  wifiUp = n >= 2 && f[1][0] == '1';
+  if (wifiUp && n >= 5) {
+    pct_decode(f[2]);
+    strncpy(wifiSsid, f[2], sizeof(wifiSsid) - 1);
+    wifiSignal = atoi(f[3]);
+    strncpy(wifiIp, f[4], sizeof(wifiIp) - 1);
+  }
+  link_check_cb(nullptr);
+}
+
+static void onLineFromPi(char *line) {
+#if DEBUG_SERIAL_ECHO
+  Serial.print("<< ");
+  Serial.println(line);
+#endif
+  char *f[8];
+  bool known = true;
+
+  if (!strncmp(line, "FILES|", 6)) {
+    setProtocolsFromFiles(line + 6);
+  } else if (!strncmp(line, "RUN|", 4)) {
+    int n = split_fields(line, f, 8);
+    on_run(f, n);
+  } else if (!strncmp(line, "STATUS|", 7)) {
+    int n = split_fields(line, f, 8);
+    on_status(f, n);
+  } else if (!strncmp(line, "WIFI_LIST|", 10)) {
+    on_wifi_list(line + 10);
+  } else if (!strncmp(line, "WIFI|", 5)) {
+    int n = split_fields(line, f, 8);
+    on_wifi(f, n);
+  } else if (!strncmp(line, "OK|WIFI", 7)) {
+    int n = split_fields(line, f, 8);
+    on_wifi_result(true, n > 2 ? f[2] : nullptr);
+  } else if (!strncmp(line, "ERR|WIFI|", 9)) {
+    pct_decode(line + 9);
+    on_wifi_result(false, line + 9);
+  } else if (!strncmp(line, "ERR|", 4)) {
+    if (running && !demoRun) finish_run("Run failed", false);
+  } else if (strncmp(line, "OK|", 3)) {
+    known = false;
+  }
+  if (known) lastPiMsgMs = millis();
 }
 
 // ----------------------------- setup / loop -----------------------
@@ -871,12 +1387,13 @@ void setup() {
   lv_scr_load(scrLoading);
   pump_for(100);
 
-#if DEMO_RUN_SIMULATION
+  // Placeholder list until the Pi sends FILES|...
   for (int i = 0; i < 5; i++) snprintf(protoNames[i], sizeof(protoNames[0]), "Protocol %03d", i + 1);
   protoCount = 5;
-#endif
   createHomeScreen();
   createListScreen();
+  createWifiScreen();
+  createWifiPasswordScreen();
   createDetailScreen();
   createRunScreen();
 
