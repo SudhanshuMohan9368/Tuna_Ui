@@ -61,10 +61,13 @@ build this code.
 | ESP32 sends | Pi replies |
 |---|---|
 | `CMD\|LIST` | `FILES\|a.gcode;b.gcode;...` |
-| `CMD\|HOME` | `OK\|HOME` or `ERR\|<msg>` |
-| `CMD\|RESTART` | `OK\|RESTART` or `ERR\|<msg>` |
-| `CMD\|ESTOP` | (none) |
 | `CMD\|PRINT\|<file>` | `OK\|PRINT` or `ERR\|<msg>` |
+| `CMD\|CANCEL` | (none) |
+| `CMD\|ESTOP` | (none) |
+
+Run progress (time left, current step) is not reported by the Pi yet; the run screen
+simulates it while `DEMO_RUN_SIMULATION` is 1 in `tuna_ui.ino`. `ERR|...` during a run
+shows "Run failed".
 
 The Pi link and debug output currently share the USB `Serial`, so every command is followed by
 a `>> CMD|...` echo line. The Pi side must ignore lines starting with `>>`, or `RPI_SERIAL`
