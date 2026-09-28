@@ -66,7 +66,17 @@ class Moonraker:
         self.url = url.rstrip("/")
 
     def _call(self, method, path, params=None, timeout=5):
-        query = "?" + urllib.parse.urlencode(params) if params else ""
+        # Moonraker's "all attributes of this object" query syntax is a bare
+        # key with no '=' at all (?print_stats&display_status) - urlencode()
+        # can only emit key=value, and key= (empty value) is a different,
+        # ambiguous query Moonraker may filter down to an empty attribute
+        # list instead of "everything" (this was silently dropping fields
+        # like print_stats.print_duration).
+        if params:
+            parts = [k if v in (None, "") else f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items()]
+            query = "?" + "&".join(parts)
+        else:
+            query = ""
         data = b"" if method == "POST" else None
         req = urllib.request.Request(self.url + path + query, data=data, method=method)
         with urllib.request.urlopen(req, timeout=timeout) as r:
