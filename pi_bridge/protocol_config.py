@@ -17,24 +17,24 @@ counting a known duration down, since there's nothing to count down from.
 """
 
 PROTOCOLS = {
-    "rgb_01_solid_colors.gcode": {
-        "time": 30,
-        "desc": "Shows a fixed color on the strip.",
+    "Protocol_1.gcode": {
+        "time": 20000,  # ~5.5 hours - double check this is really intended
+        "desc": "Bead Pickup Protocol.",
     },
-    "rgb_02_blink_red.gcode": {
-        "time": 60,
+    "Protocol_2.gcode": {
+        "time": 10000,  # ~2.8 hours - double check this is really intended
         "desc": "Blinks the strip red.",
     },
-    "rgb_03_fade_white.gcode": {
+    "Protocol_3.gcode": {
         "time": 90,
         "desc": "Fades the strip through white.",
     },
-    "rgb_04_rainbow.gcode": {
+    "Protocol_4.gcode": {
         "time": 120,
         "desc": "Cycles the strip through a rainbow.",
     },
-    "rgb_05_machine_status.gcode": {
-        "time": 15,
+    "Protocol_5.gcode": {
+        "time": 15,  # placeholder - set the real value
         "desc": "Shows machine status colors.",
     },
 }

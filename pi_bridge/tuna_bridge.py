@@ -206,9 +206,16 @@ class Bridge:
 
     def load_run(self, filename):
         # Reloaded every run so editing protocol_config.py takes effect on
-        # the next Start run, no service restart needed.
-        importlib.reload(protocol_config)
-        cfg = protocol_config.PROTOCOLS.get(filename)
+        # the next Start run, no service restart needed. A typo in that
+        # file (bad syntax, PROTOCOLS missing, etc.) must not crash this -
+        # status_loop() calls load_run() with no try/except around it, so
+        # an uncaught error here would silently kill status updates.
+        try:
+            importlib.reload(protocol_config)
+            cfg = protocol_config.PROTOCOLS.get(filename)
+        except Exception as e:
+            log.warning("protocol_config.py failed to load: %s", e)
+            cfg = None
         if cfg:
             total = int(cfg.get("time", 0))
             steps = list(cfg.get("steps", []))
