@@ -23,14 +23,33 @@ import urllib.request
 
 import serial  # apt install python3-serial
 
-import protocol_config  # same folder - edit this file to set each test's time
-
 log = logging.getLogger("tuna")
 
 MAX_FILES_LINE = 700      # display's receive buffer is 768 bytes
 STATUS_PERIOD_S = 1.0
 WIFI_PERIOD_S = 5.0
 RECOVER_TIMEOUT_S = 25    # firmware_restart -> Klipper "ready" again; display waits 30s
+
+_protocol_config_module = None
+
+
+def load_protocol_config():
+    """PROTOCOLS dict from protocol_config.py (same folder), re-read from disk
+    every call so edits need no service restart. A mistake in that file
+    (missing, bad syntax, ...) must never crash the whole bridge - serial,
+    Klipper control and Wi-Fi all matter far more than the run timer - so
+    this always returns a dict, logging a warning and falling back to {} on
+    any failure instead of raising."""
+    global _protocol_config_module
+    try:
+        if _protocol_config_module is None:
+            _protocol_config_module = importlib.import_module("protocol_config")
+        else:
+            importlib.reload(_protocol_config_module)
+        return _protocol_config_module.PROTOCOLS
+    except Exception as e:
+        log.warning("protocol_config.py failed to load: %s", e)
+        return {}
 
 
 def enc(s):
@@ -205,17 +224,7 @@ class Bridge:
         self.send(f"RUN|{r['file']}|{r['total']}|{steps}|{enc(r['desc'])}")
 
     def load_run(self, filename):
-        # Reloaded every run so editing protocol_config.py takes effect on
-        # the next Start run, no service restart needed. A typo in that
-        # file (bad syntax, PROTOCOLS missing, etc.) must not crash this -
-        # status_loop() calls load_run() with no try/except around it, so
-        # an uncaught error here would silently kill status updates.
-        try:
-            importlib.reload(protocol_config)
-            cfg = protocol_config.PROTOCOLS.get(filename)
-        except Exception as e:
-            log.warning("protocol_config.py failed to load: %s", e)
-            cfg = None
+        cfg = load_protocol_config().get(filename)
         if cfg:
             total = int(cfg.get("time", 0))
             steps = list(cfg.get("steps", []))
