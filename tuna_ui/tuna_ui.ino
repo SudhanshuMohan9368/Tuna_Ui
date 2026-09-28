@@ -1115,13 +1115,29 @@ static void finish_run(const char *title, bool ok) {
   show_result(title, ok);
 }
 
-// Standalone demo only (no Pi): fake a 4-step run.
+// The display counts its own seconds for BOTH demo and real runs, driven
+// only by runTotalS (protocol_config.py's configured time, sent in RUN|...).
+// This used to instead wait for the bridge's STATUS|... elapsed value every
+// second, which made the visible timer only as reliable as Klipper's own
+// print_duration reporting (a real bug there once left it stuck at 0
+// forever). The bridge is now only needed to say the run finished, failed,
+// got cancelled, or is paused - not to drive the number itself.
 static void run_tick_cb(lv_timer_t *t) {
   runElapsedS++;
-  curStep = runElapsedS / DEMO_STEP_SECONDS + 1;
-  curStepPct = (runElapsedS % DEMO_STEP_SECONDS) * 100 / DEMO_STEP_SECONDS;
+  if (stepCount > 0) {
+    uint32_t perStep = runTotalS > 0 ? runTotalS / stepCount : DEMO_STEP_SECONDS;
+    if (perStep == 0) perStep = 1;
+    curStep = runElapsedS / perStep + 1;
+    if (curStep > stepCount) curStep = stepCount;
+    curStepPct = (runElapsedS % perStep) * 100 / perStep;
+  }
   update_run_ui();
-  if (runElapsedS >= runTotalS) finish_run("Run completed", true);
+  // Demo mode has no real machine behind it, so the fake timer running out
+  // IS "done". A real run keeps ticking past its estimated time (clamped at
+  // 00:00 / last step full) instead of declaring victory on its own - only
+  // the bridge's actual STATUS|complete|... (on_status(), below) may do
+  // that, since the machine could genuinely still be finishing up.
+  if (demoRun && runTotalS > 0 && runElapsedS >= runTotalS) finish_run("Run completed", true);
 }
 
 // If Start run got no RUN|... from the bridge at all within this window,
@@ -1341,23 +1357,26 @@ static void on_run(char **f, int n) {
   set_steps(names, count);
 
   if (runStartTimeout) { lv_timer_del(runStartTimeout); runStartTimeout = nullptr; }
-  if (demoRun) lv_timer_pause(runTimer);
   demoRun = false;
   running = true;
   runElapsedS = 0;
   curStep = 1;
-  curStepPct = 50;
+  curStepPct = 0;
+  update_run_ui();
+  lv_timer_reset(runTimer);
+  lv_timer_resume(runTimer);  // local tick now drives the visible number - see run_tick_cb()
   show_run_screen(selectedName);
 }
 
-// STATUS|state|elapsed_s|step
+// STATUS|state|elapsed_s|step - only used for real state transitions now
+// (finished/failed/cancelled/paused); the visible timer/step numbers come
+// from the display's own local tick (run_tick_cb), not from here.
 static void on_status(char **f, int n) {
-  if (!running || demoRun || n < 3) return;
+  if (!running || demoRun || n < 2) return;
   const char *state = f[1];
-  runElapsedS = strtoul(f[2], nullptr, 10);
-  if (n > 3 && atoi(f[3]) > 0) curStep = atoi(f[3]);
 
-  if (!strcmp(state, "printing") || !strcmp(state, "paused")) update_run_ui();
+  if (!strcmp(state, "printing")) lv_timer_resume(runTimer);
+  else if (!strcmp(state, "paused")) lv_timer_pause(runTimer);
   else if (!strcmp(state, "complete")) finish_run("Run completed", true);
   else if (!strcmp(state, "cancelled")) finish_run("Run cancelled", false);
   else if (!strcmp(state, "error")) finish_run("Run failed", false);
