@@ -99,6 +99,9 @@ lv_disp_drv_t disp_drv;
 static char protoNames[MAX_PROTOCOLS][64];
 static int protoCount = 0;
 static char selectedName[64] = "";
+// False until a real FILES|... arrives from the bridge - the placeholder
+// "Protocol 001..005" list on screen before that is not launchable.
+static bool haveRealFiles = false;
 
 #define STEP_MAX 6
 static const char *DEMO_STEPS[] = {"Binding", "Wash 1", "Wash 2", "Elution"};
@@ -414,12 +417,24 @@ static void show_confirm(const char *title, const char *desc, action_fn on_confi
   button(c, 154, by, 122, 40, "Confirm", COL_ACCENT, F14, modal_action_cb, (void *)on_confirm);
 }
 
+// Set only when the result modal being shown is for an E-stop - "Back to
+// home" then needs to recover the machine first (see below), not just
+// switch screens.
+static bool resultIsEstopRecovery = false;
+static void begin_estop_recover();
+
 static void result_home_cb(lv_event_t *e) {
   close_modal_of(lv_event_get_current_target(e));
-  goHome();
+  if (resultIsEstopRecovery) {
+    resultIsEstopRecovery = false;
+    begin_estop_recover();
+  } else {
+    goHome();
+  }
 }
 
-static void show_result(const char *title, bool ok) {
+static void show_result(const char *title, bool ok, bool estop_recovery = false) {
+  resultIsEstopRecovery = estop_recovery;
   lv_obj_t *ov = overlay_create();
   lv_obj_t *c = modal_card(ov, 0, 0, 300, 180);
   lv_obj_center(c);
@@ -527,7 +542,13 @@ static void wifi_screen_refresh_current();
 static void wifi_refresh_cb(lv_event_t *e);
 
 static void help_btn_cb(lv_event_t *e) { show_help_menu(); }
-static void choose_protocol_cb(lv_event_t *e) { lv_scr_load(scrList); }
+static void choose_protocol_cb(lv_event_t *e) {
+  lv_scr_load(scrList);
+  // The very first CMD|LIST (at boot) can lose the race against Klipper/
+  // Moonraker still starting up - re-ask every time this screen opens so
+  // a stale placeholder list doesn't linger until the next reboot.
+  if (pi_connected()) sendLine("CMD|LIST");
+}
 
 static void wifi_btn_cb(lv_event_t *e) {
   lv_scr_load(scrWifi);
@@ -709,11 +730,18 @@ static void toggle_pw_visibility_cb(lv_event_t *e) {
 
 static void wifi_pass_back_cb(lv_event_t *e) { lv_scr_load(scrWifi); }
 
+// Shared by the keyboard's own Enter key and the top "Connect" button.
+static void wifi_pass_submit() {
+  begin_wifi_connect(wifiConnectSsid, lv_textarea_get_text(taWifiPass));
+  lv_scr_load(scrWifi);
+}
+
+static void wifi_pass_connect_btn_cb(lv_event_t *e) { wifi_pass_submit(); }
+
 static void wifi_pass_kb_cb(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_READY) {
-    begin_wifi_connect(wifiConnectSsid, lv_textarea_get_text(taWifiPass));
-    lv_scr_load(scrWifi);
+    wifi_pass_submit();
   } else if (code == LV_EVENT_CANCEL) {
     lv_scr_load(scrWifi);
   }
@@ -722,27 +750,33 @@ static void wifi_pass_kb_cb(lv_event_t *e) {
 static void createWifiPasswordScreen() {
   scrWifiPass = new_screen();
 
-  // Compact header (not back_header's usual 60px) - the keyboard needs
-  // every spare pixel of height on a 320-tall screen.
-  lv_obj_t *back = box(scrWifiPass, 0, 0, 200, 28);
-  make_clickable(back, wifi_pass_back_cb, nullptr);
-  lv_obj_set_pos(label(back, LV_SYMBOL_LEFT, F14, COL_TEXT), 10, 5);
-  lblWifiPassTitle = label(back, "Network", F14, COL_TEXT);
-  lv_obj_set_pos(lblWifiPassTitle, 34, 5);
+  // One compact row: back + Wi-Fi icon + SSID + Connect, all together -
+  // this is the same total height (34px) as the old two-line header, so
+  // the keyboard below keeps the exact 252px it needs for all 5 rows.
+  lv_obj_t *top = box(scrWifiPass, 0, 0, W, 34);
+  make_clickable(top, wifi_pass_back_cb, nullptr);
+  lv_obj_set_pos(label(top, LV_SYMBOL_LEFT, F14, COL_TEXT), 10, 10);
+  lv_obj_set_pos(label(top, LV_SYMBOL_WIFI, F14, COL_TEXT), 34, 10);
+  lblWifiPassTitle = label(top, "Network", F14, COL_TEXT);
+  lv_obj_set_pos(lblWifiPassTitle, 58, 9);
+  button(top, 356, 3, 108, 28, "Connect", COL_ACCENT, F14, wifi_pass_connect_btn_cb, nullptr);
+  hline(scrWifiPass, 0, 34, W);
 
   taWifiPass = lv_textarea_create(scrWifiPass);
   lv_textarea_set_one_line(taWifiPass, true);
   lv_textarea_set_password_mode(taWifiPass, true);
   lv_textarea_set_placeholder_text(taWifiPass, "Password");
-  lv_obj_set_pos(taWifiPass, 12, 30);
-  lv_obj_set_size(taWifiPass, 336, 34);
+  lv_obj_set_pos(taWifiPass, 12, 36);
+  lv_obj_set_size(taWifiPass, 336, 32);
 
-  circle_button(scrWifiPass, 356, 30, LV_SYMBOL_EYE_CLOSE, toggle_pw_visibility_cb, 34, F14);
+  circle_button(scrWifiPass, 356, 36, LV_SYMBOL_EYE_CLOSE, toggle_pw_visibility_cb, 32, F14);
 
   // Full-width, nearly the whole rest of the screen. The default theme's
   // per-key minimum height (meant for bigger displays) is taller than a
   // 5-row keyboard can fit here, so rows beyond what fits at that minimum
   // were simply not drawn - min_height=0 lets keys shrink to fit instead.
+  // KB_Y=68 is proven to show all 5 rows fully - do not shrink this further
+  // without actually re-testing on the board.
   const int KB_Y = 68;
   lv_obj_t *kb = lv_keyboard_create(scrWifiPass);
   lv_keyboard_set_textarea(kb, taWifiPass);
@@ -838,6 +872,49 @@ static void on_wifi_result(bool ok, const char *detail) {
   else snprintf(msg, sizeof(msg), "%s", (detail && detail[0]) ? detail : "Connection failed.");
   show_message(ok ? "Wi-Fi connected" : "Wi-Fi", msg);
   wifi_screen_refresh_current();
+}
+
+// --- E-stop recovery: FIRMWARE_RESTART then G28, run on the Pi side -----
+static lv_obj_t *recoverOverlay = nullptr;
+static lv_timer_t *recoverTimeout = nullptr;
+
+static void recover_timeout_cb(lv_timer_t *t) {
+  recoverTimeout = nullptr;
+  if (recoverOverlay) {
+    lv_obj_del(recoverOverlay);
+    recoverOverlay = nullptr;
+    show_message("Restart", "No response from the controller. Home the machine manually before the next run.");
+  }
+  goHome();
+}
+
+static void begin_estop_recover() {
+  sendLine("CMD|RECOVER");
+
+  if (recoverOverlay) lv_obj_del(recoverOverlay);
+  recoverOverlay = overlay_create();
+  lv_obj_t *c = modal_card(recoverOverlay, 0, 0, 260, 150);
+  lv_obj_center(c);
+  lv_obj_t *sp = lv_spinner_create(c, 1000, 60);
+  lv_obj_set_size(sp, 40, 40);
+  lv_obj_align(sp, LV_ALIGN_TOP_MID, 0, 22);
+  lv_obj_set_style_arc_color(sp, C(COL_ACCENT), LV_PART_INDICATOR);
+  lv_obj_t *l = label(c, "Restarting firmware\nand homing...", F14, COL_TEXT);
+  lv_obj_set_width(l, 220);
+  lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(l, LV_ALIGN_BOTTOM_MID, 0, -20);
+
+  if (recoverTimeout) lv_timer_del(recoverTimeout);
+  recoverTimeout = lv_timer_create(recover_timeout_cb, 30000, nullptr);
+  lv_timer_set_repeat_count(recoverTimeout, 1);
+}
+
+// Called from the serial parser below on OK|RECOVER or ERR|RECOVER|...
+static void on_recover_result(bool ok, const char *detail) {
+  if (recoverTimeout) { lv_timer_del(recoverTimeout); recoverTimeout = nullptr; }
+  if (recoverOverlay) { lv_obj_del(recoverOverlay); recoverOverlay = nullptr; }
+  if (!ok) show_message("Restart", (detail && detail[0]) ? detail : "Restart/home failed. Home the machine manually before the next run.");
+  goHome();
 }
 
 // WIFI_LIST|ssid,signal,secure;ssid2,signal2,secure2;...
@@ -1054,15 +1131,20 @@ static void run_start_timeout_cb(lv_timer_t *t) {
 }
 
 static void start_run_cb(lv_event_t *e) {
-  char cmd[96];
-  snprintf(cmd, sizeof(cmd), "CMD|PRINT|%s", selectedName);
-  sendLine(cmd);
-
   running = true;
   runElapsedS = 0;
   curStep = 1;
   curStepPct = 0;
-  demoRun = !pi_connected();
+  // pi_connected() alone isn't enough: the bridge can be alive while the
+  // list on screen is still the pre-connection placeholder (e.g. Moonraker
+  // wasn't up yet when we first asked) - sending a real PRINT for a name
+  // that was never a real file just gets a 404 from Klipper.
+  demoRun = !pi_connected() || !haveRealFiles;
+  if (!demoRun) {
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "CMD|PRINT|%s", selectedName);
+    sendLine(cmd);
+  }
   if (demoRun) {
     runTotalS = 4 * DEMO_STEP_SECONDS;
     strcpy(runDesc, "Demo run - no controller connected.");
@@ -1090,7 +1172,7 @@ static void do_cancel_run() {
 static void do_estop() {
   sendLine("CMD|ESTOP");
   stop_run();
-  show_result("Emergency stop activated", false);
+  show_result("Emergency stop activated", false, /*estop_recovery=*/true);
 }
 
 static void cancel_cb(lv_event_t *e) {
@@ -1194,6 +1276,7 @@ static void setProtocolsFromFiles(const char *files) {
   strncpy(tmp, files, sizeof(tmp) - 1);
   tmp[sizeof(tmp) - 1] = 0;
 
+  haveRealFiles = true;
   protoCount = 0;
   for (char *p = strtok(tmp, ";"); p && protoCount < MAX_PROTOCOLS; p = strtok(nullptr, ";")) {
     while (*p == ' ') p++;
@@ -1315,6 +1398,11 @@ static void onLineFromPi(char *line) {
   } else if (!strncmp(line, "ERR|WIFI|", 9)) {
     pct_decode(line + 9);
     on_wifi_result(false, line + 9);
+  } else if (!strncmp(line, "OK|RECOVER", 10)) {
+    on_recover_result(true, nullptr);
+  } else if (!strncmp(line, "ERR|RECOVER|", 12)) {
+    pct_decode(line + 12);
+    on_recover_result(false, line + 12);
   } else if (!strncmp(line, "ERR|", 4)) {
     if (running && !demoRun) finish_run("Run failed", false);
   } else if (strncmp(line, "OK|", 3)) {

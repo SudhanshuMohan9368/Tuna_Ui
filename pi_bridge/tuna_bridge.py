@@ -10,6 +10,7 @@ Message format: README.md ("Serial protocol").
 """
 import argparse
 import glob
+import importlib
 import json
 import logging
 import re
@@ -22,11 +23,14 @@ import urllib.request
 
 import serial  # apt install python3-serial
 
+import protocol_config  # same folder - edit this file to set each test's time
+
 log = logging.getLogger("tuna")
 
 MAX_FILES_LINE = 700      # display's receive buffer is 768 bytes
 STATUS_PERIOD_S = 1.0
 WIFI_PERIOD_S = 5.0
+RECOVER_TIMEOUT_S = 25    # firmware_restart -> Klipper "ready" again; display waits 30s
 
 
 def enc(s):
@@ -171,12 +175,21 @@ class Bridge:
             except serial.SerialException as e:
                 log.warning("write failed: %s", e)
 
-    def send_files(self):
-        try:
-            items = self.mr.get("/server/files/list", root="gcodes")
-        except Exception as e:
-            self.send(f"ERR|{enc(error_text(e))}")
-            return
+    def send_files(self, retries=0, retry_delay=2):
+        # retries>0 is for the very first push on connect: Klipper/Moonraker
+        # can still be starting up right as the bridge and display come up
+        # together, and a bare failure here left the display showing its
+        # placeholder list with no way to recover short of a reboot.
+        for attempt in range(retries + 1):
+            try:
+                items = self.mr.get("/server/files/list", root="gcodes")
+                break
+            except Exception as e:
+                if attempt < retries:
+                    time.sleep(retry_delay)
+                    continue
+                self.send(f"ERR|{enc(error_text(e))}")
+                return
         names = sorted(i["path"] for i in items if i["path"].lower().endswith(".gcode"))
         line = "FILES|"
         for n in names:
@@ -192,11 +205,20 @@ class Bridge:
         self.send(f"RUN|{r['file']}|{r['total']}|{steps}|{enc(r['desc'])}")
 
     def load_run(self, filename):
-        try:
-            total, steps, desc = run_info_from_gcode(self.mr.read_gcode(filename))
-        except Exception as e:
-            log.warning("could not read %s for run info: %s", filename, e)
-            total, steps, desc = 0, [], ""
+        # Reloaded every run so editing protocol_config.py takes effect on
+        # the next Start run, no service restart needed.
+        importlib.reload(protocol_config)
+        cfg = protocol_config.PROTOCOLS.get(filename)
+        if cfg:
+            total = int(cfg.get("time", 0))
+            steps = list(cfg.get("steps", []))
+            desc = cfg.get("desc", "")
+        else:
+            try:
+                total, steps, desc = run_info_from_gcode(self.mr.read_gcode(filename))
+            except Exception as e:
+                log.warning("could not read %s for run info: %s", filename, e)
+                total, steps, desc = 0, [], ""
         self.run = {"file": filename, "total": total, "steps": steps, "desc": desc}
 
     # --- serial in
@@ -222,6 +244,8 @@ class Bridge:
                 self.send("OK|CANCEL")
             elif cmd == "ESTOP":
                 self.mr.post("/printer/emergency_stop")
+            elif cmd == "RECOVER":
+                threading.Thread(target=self.do_recover, daemon=True).start()
             elif cmd == "WIFI_SCAN" and self.wifi_enabled:
                 threading.Thread(target=self.do_wifi_scan, daemon=True).start()
             elif cmd == "WIFI_CONNECT" and self.wifi_enabled and len(parts) >= 3:
@@ -231,6 +255,39 @@ class Bridge:
         except Exception as e:
             log.warning("%s failed: %s", cmd, e)
             self.send(f"ERR|{enc(error_text(e))}")
+
+    # After an E-stop (M112), Klipper's MCU connection is in a shutdown
+    # state and refuses everything, including G28, until FIRMWARE_RESTART
+    # brings it back. Runs off the serial thread since the restart+home
+    # can take several seconds.
+    def do_recover(self):
+        try:
+            self.mr.post("/printer/firmware_restart")
+        except Exception as e:
+            log.warning("firmware_restart failed: %s", e)
+            self.send(f"ERR|RECOVER|{enc(error_text(e))}")
+            return
+
+        deadline = time.time() + RECOVER_TIMEOUT_S
+        ready = False
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                if self.mr.get("/printer/info").get("state") == "ready":
+                    ready = True
+                    break
+            except Exception:
+                continue  # Klipper is mid-restart; keep polling
+        if not ready:
+            self.send("ERR|RECOVER|Klipper did not come back after restart")
+            return
+
+        try:
+            self.mr.post("/printer/gcode/script", script="G28")
+            self.send("OK|RECOVER")
+        except Exception as e:
+            log.warning("G28 after recover failed: %s", e)
+            self.send(f"ERR|RECOVER|{enc(error_text(e))}")
 
     # --- Klipper status push
     def status_loop(self):
@@ -333,7 +390,7 @@ class Bridge:
             log.info("display connected on %s", port)
             with self.tx_lock:
                 self.ser = ser
-            self.send_files()
+            self.send_files(retries=5, retry_delay=3)  # ride out Moonraker still starting up
             buf = b""
             try:
                 while True:
