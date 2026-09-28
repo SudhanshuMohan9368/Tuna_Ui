@@ -28,7 +28,10 @@ log = logging.getLogger("tuna")
 MAX_FILES_LINE = 700      # display's receive buffer is 768 bytes
 STATUS_PERIOD_S = 1.0
 WIFI_PERIOD_S = 5.0
-RECOVER_TIMEOUT_S = 25    # firmware_restart -> Klipper "ready" again; display waits 30s
+RECOVER_TIMEOUT_S = 25    # firmware_restart -> Klipper "ready" again
+G28_TIMEOUT_S = 120       # real homing move, blocks the HTTP call until done
+# worst case ~ RECOVER_TIMEOUT_S + G28_TIMEOUT_S; display's own wait (tuna_ui.ino,
+# recoverTimeout) must stay comfortably above that or it gives up first
 
 _protocol_config_module = None
 
@@ -69,11 +72,11 @@ class Moonraker:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())["result"]
 
-    def get(self, path, **params):
-        return self._call("GET", path, params)
+    def get(self, path, timeout=5, **params):
+        return self._call("GET", path, params, timeout)
 
-    def post(self, path, **params):
-        return self._call("POST", path, params)
+    def post(self, path, timeout=5, **params):
+        return self._call("POST", path, params, timeout)
 
     def read_gcode(self, filename, limit=2_000_000):
         url = f"{self.url}/server/files/gcodes/{urllib.parse.quote(filename)}"
@@ -299,7 +302,10 @@ class Bridge:
             return
 
         try:
-            self.mr.post("/printer/gcode/script", script="G28")
+            # Moonraker's gcode/script call blocks until the command actually
+            # finishes - the default 5s HTTP timeout was nowhere near enough
+            # for a real homing move and made a successful G28 look "failed".
+            self.mr.post("/printer/gcode/script", script="G28", timeout=G28_TIMEOUT_S)
             self.send("OK|RECOVER")
         except Exception as e:
             log.warning("G28 after recover failed: %s", e)

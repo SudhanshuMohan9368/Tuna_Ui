@@ -103,6 +103,9 @@ turn it on only for USB-monitor debugging with nothing driving the bridge.
   in `bsp_touch_read()` first.
 - **Orientation.** If the image is upside-down, change `LCD_ROTATION` in `tuna_ui.ino`
   (1 or 3). Touch follows it automatically.
-- **`CMD|RECOVER` is untested against real Klipper hardware** - the `FIRMWARE_RESTART` -> wait
-  -> `G28` sequence in `tuna_bridge.py`'s `do_recover()` was only checked for syntax, not on
-  an actual printer board. Test an E-stop -> "Back to home" for real before relying on it.
+- **`CMD|RECOVER` timing.** `FIRMWARE_RESTART` -> wait for Klipper `ready` -> `G28` has been
+  run against real Klipper hardware once and completed successfully, but `/printer/gcode/script`
+  blocks until the gcode actually finishes, so `G28_TIMEOUT_S` in `tuna_bridge.py` (120s) needs
+  to comfortably exceed how long a real homing move takes on your machine - and the display's
+  own `recoverTimeout` in `tuna_ui.ino` needs to stay above `RECOVER_TIMEOUT_S + G28_TIMEOUT_S`,
+  or it gives up and shows an error before the bridge would have reported success anyway.

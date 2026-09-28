@@ -904,8 +904,12 @@ static void begin_estop_recover() {
   lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(l, LV_ALIGN_BOTTOM_MID, 0, -20);
 
+  // Must stay above the bridge's own worst case: up to 25s waiting for
+  // Klipper "ready" after firmware_restart, plus up to 120s for a real
+  // G28 homing move to finish (RECOVER_TIMEOUT_S / G28_TIMEOUT_S in
+  // tuna_bridge.py) - 160s gives some margin on top of that.
   if (recoverTimeout) lv_timer_del(recoverTimeout);
-  recoverTimeout = lv_timer_create(recover_timeout_cb, 30000, nullptr);
+  recoverTimeout = lv_timer_create(recover_timeout_cb, 160000, nullptr);
   lv_timer_set_repeat_count(recoverTimeout, 1);
 }
 
