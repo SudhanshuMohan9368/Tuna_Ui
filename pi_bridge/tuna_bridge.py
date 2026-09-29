@@ -269,8 +269,7 @@ class Bridge:
                 self.mr.post("/printer/print/start", filename=parts[2])
                 self.send("OK|PRINT")
             elif cmd == "CANCEL":
-                self.mr.post("/printer/print/cancel")
-                self.send("OK|CANCEL")
+                threading.Thread(target=self.do_cancel, daemon=True).start()
             elif cmd == "ESTOP":
                 self.mr.post("/printer/emergency_stop")
             elif cmd == "RECOVER":
@@ -285,16 +284,21 @@ class Bridge:
             log.warning("%s failed: %s", cmd, e)
             self.send(f"ERR|{enc(error_text(e))}")
 
-    # After an E-stop (M112), Klipper's MCU connection is in a shutdown
-    # state and refuses everything, including G28, until FIRMWARE_RESTART
-    # brings it back. Runs off the serial thread since the restart+home
-    # can take several seconds.
-    def do_recover(self):
+    # Shared by RECOVER (after an E-stop) and CANCEL: FIRMWARE_RESTART does a
+    # real MCU reset, which is the only thing that reliably stops a protocol
+    # mid-macro. CANCEL_PRINT alone can't - it only stops virtual_sdcard from
+    # feeding the *next* line; a macro already dispatched (these protocols
+    # use big jinja for-loops, e.g. mix_10 loops 858 times) keeps running
+    # its already-queued moves regardless. FIRMWARE_RESTART resets the MCU
+    # itself, wiping the motion queue outright, then G28 returns the machine
+    # to a known position. reply_prefix picks OK|RECOVER/ERR|RECOVER|... vs
+    # OK|CANCEL/ERR|CANCEL|... so the display shows the right flow.
+    def _restart_and_home(self, reply_prefix):
         try:
             self.mr.post("/printer/firmware_restart")
         except Exception as e:
             log.warning("firmware_restart failed: %s", e)
-            self.send(f"ERR|RECOVER|{enc(error_text(e))}")
+            self.send(f"ERR|{reply_prefix}|{enc(error_text(e))}")
             return
 
         deadline = time.time() + RECOVER_TIMEOUT_S
@@ -308,7 +312,7 @@ class Bridge:
             except Exception:
                 continue  # Klipper is mid-restart; keep polling
         if not ready:
-            self.send("ERR|RECOVER|Klipper did not come back after restart")
+            self.send(f"ERR|{reply_prefix}|Klipper did not come back after restart")
             return
 
         try:
@@ -316,10 +320,21 @@ class Bridge:
             # finishes - the default 5s HTTP timeout was nowhere near enough
             # for a real homing move and made a successful G28 look "failed".
             self.mr.post("/printer/gcode/script", script="G28", timeout=G28_TIMEOUT_S)
-            self.send("OK|RECOVER")
+            self.send(f"OK|{reply_prefix}")
         except Exception as e:
-            log.warning("G28 after recover failed: %s", e)
-            self.send(f"ERR|RECOVER|{enc(error_text(e))}")
+            log.warning("G28 after %s failed: %s", reply_prefix, e)
+            self.send(f"ERR|{reply_prefix}|{enc(error_text(e))}")
+
+    def do_recover(self):
+        self._restart_and_home("RECOVER")
+
+    def do_cancel(self):
+        try:
+            self.mr.post("/printer/print/cancel")
+        except Exception as e:
+            log.warning("print/cancel failed (continuing to restart+home anyway): %s", e)
+        self.run = None
+        self._restart_and_home("CANCEL")
 
     # --- Klipper status push
     def status_loop(self):

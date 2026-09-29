@@ -486,9 +486,19 @@ static void show_about() {
   lv_obj_set_pos(label(c, "Build : " __DATE__, F12, COL_MUTED), 16, 84);
 }
 
+// Manual, on-demand version of E-stop recovery - same restart+home, just
+// triggered from the Help menu instead of after an E-stop.
+static void do_manual_reset() {
+  begin_estop_recover();
+}
+
+static void show_reset_confirm() {
+  show_confirm("Reset machine?", "Restarts the firmware and homes all axes.", do_manual_reset);
+}
+
 static void show_help_menu() {
-  static const char *items[] = {"User manual", "Protocol guides", "About", "Contact us"};
-  static const action_fn actions[] = {nullptr, show_qr, show_about, nullptr};
+  static const char *items[] = {"User manual", "Protocol guides", "About", "Reset machine"};
+  static const action_fn actions[] = {nullptr, show_qr, show_about, show_reset_confirm};
   const int rowH = 33;
 
   lv_obj_t *ov = overlay_create();
@@ -874,7 +884,12 @@ static void on_wifi_result(bool ok, const char *detail) {
   wifi_screen_refresh_current();
 }
 
-// --- E-stop recovery: FIRMWARE_RESTART then G28, run on the Pi side -----
+// --- Stop-and-home: FIRMWARE_RESTART then G28, run on the Pi side --------
+// Shared by E-stop recovery, Cancel run, and the manual "Reset machine"
+// option - all three need the same real MCU reset + home, not just a
+// screen change. CANCEL_PRINT alone can't reliably stop a protocol
+// mid-macro (these use big jinja for-loops already queued past that
+// point), so Cancel goes through this exact same sequence as an E-stop.
 static lv_obj_t *recoverOverlay = nullptr;
 static lv_timer_t *recoverTimeout = nullptr;
 
@@ -883,13 +898,13 @@ static void recover_timeout_cb(lv_timer_t *t) {
   if (recoverOverlay) {
     lv_obj_del(recoverOverlay);
     recoverOverlay = nullptr;
-    show_message("Restart", "No response from the controller. Home the machine manually before the next run.");
+    show_message("Reset", "No response from the controller. Home the machine manually before the next run.");
   }
   goHome();
 }
 
-static void begin_estop_recover() {
-  sendLine("CMD|RECOVER");
+static void begin_stop_and_home(const char *cmd, const char *spinner_text) {
+  sendLine(cmd);
 
   if (recoverOverlay) lv_obj_del(recoverOverlay);
   recoverOverlay = overlay_create();
@@ -899,7 +914,7 @@ static void begin_estop_recover() {
   lv_obj_set_size(sp, 40, 40);
   lv_obj_align(sp, LV_ALIGN_TOP_MID, 0, 22);
   lv_obj_set_style_arc_color(sp, C(COL_ACCENT), LV_PART_INDICATOR);
-  lv_obj_t *l = label(c, "Restarting firmware\nand homing...", F14, COL_TEXT);
+  lv_obj_t *l = label(c, spinner_text, F14, COL_TEXT);
   lv_obj_set_width(l, 220);
   lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(l, LV_ALIGN_BOTTOM_MID, 0, -20);
@@ -913,11 +928,16 @@ static void begin_estop_recover() {
   lv_timer_set_repeat_count(recoverTimeout, 1);
 }
 
-// Called from the serial parser below on OK|RECOVER or ERR|RECOVER|...
+static void begin_estop_recover() {
+  begin_stop_and_home("CMD|RECOVER", "Restarting firmware\nand homing...");
+}
+
+// Called from the serial parser below on OK|RECOVER/OK|CANCEL or
+// ERR|RECOVER|.../ERR|CANCEL|...
 static void on_recover_result(bool ok, const char *detail) {
   if (recoverTimeout) { lv_timer_del(recoverTimeout); recoverTimeout = nullptr; }
   if (recoverOverlay) { lv_obj_del(recoverOverlay); recoverOverlay = nullptr; }
-  if (!ok) show_message("Restart", (detail && detail[0]) ? detail : "Restart/home failed. Home the machine manually before the next run.");
+  if (!ok) show_message("Reset", (detail && detail[0]) ? detail : "Restart/home failed. Home the machine manually before the next run.");
   goHome();
 }
 
@@ -1184,9 +1204,8 @@ static void start_run_cb(lv_event_t *e) {
 }
 
 static void do_cancel_run() {
-  sendLine("CMD|CANCEL");
   stop_run();
-  goHome();
+  begin_stop_and_home("CMD|CANCEL", "Cancelling and\nhoming...");
 }
 
 static void do_estop() {
@@ -1421,11 +1440,14 @@ static void onLineFromPi(char *line) {
   } else if (!strncmp(line, "ERR|WIFI|", 9)) {
     pct_decode(line + 9);
     on_wifi_result(false, line + 9);
-  } else if (!strncmp(line, "OK|RECOVER", 10)) {
+  } else if (!strncmp(line, "OK|RECOVER", 10) || !strncmp(line, "OK|CANCEL", 9)) {
     on_recover_result(true, nullptr);
   } else if (!strncmp(line, "ERR|RECOVER|", 12)) {
     pct_decode(line + 12);
     on_recover_result(false, line + 12);
+  } else if (!strncmp(line, "ERR|CANCEL|", 11)) {
+    pct_decode(line + 11);
+    on_recover_result(false, line + 11);
   } else if (!strncmp(line, "ERR|", 4)) {
     if (running && !demoRun) finish_run("Run failed", false);
   } else if (strncmp(line, "OK|", 3)) {

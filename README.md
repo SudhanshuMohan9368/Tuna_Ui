@@ -85,14 +85,20 @@ Fields are `|`-separated; SSID/password/error-text fields are percent-encoded (`
 | `CMD\|LIST` | `FILES\|a.gcode;b.gcode;...` | boot, and every time "Choose protocol" opens |
 | `CMD\|PRINT\|<file>` | `RUN\|<file>\|<total_s>\|<steps>\|<desc>`, then `OK\|PRINT` or `ERR\|<msg>` | Start run |
 | (push, ~1/s while printing) | `STATUS\|<state>\|<elapsed_s>\|<step>` | during a run |
-| `CMD\|CANCEL` | `OK\|CANCEL` | Cancel |
+| `CMD\|CANCEL` | `OK\|CANCEL` or `ERR\|CANCEL\|<msg>` | Cancel: `CANCEL_PRINT`, then the same `FIRMWARE_RESTART` -> wait -> `G28` as Recover |
 | `CMD\|ESTOP` | (none - `emergency_stop` is fire-and-forget) | Emergency stop |
-| `CMD\|RECOVER` | `OK\|RECOVER` or `ERR\|RECOVER\|<msg>` | "Back to home" after an E-stop: `FIRMWARE_RESTART`, wait for Klipper `ready`, then `G28` |
+| `CMD\|RECOVER` | `OK\|RECOVER` or `ERR\|RECOVER\|<msg>` | "Back to home" after an E-stop, or "Reset machine" in the Help menu: `FIRMWARE_RESTART`, wait for Klipper `ready`, then `G28` |
 | (push, every 5s) | `WIFI\|1\|<ssid>\|<signal%>\|<ip>` or `WIFI\|0` | always |
 | `CMD\|WIFI_SCAN` | `WIFI_LIST\|ssid,signal,secure;...` | Wi-Fi screen opens/refreshes |
 | `CMD\|WIFI_CONNECT\|<ssid>\|<pass>` | `OK\|WIFI\|<ip>` or `ERR\|WIFI\|<msg>` | choosing a network |
 
-`ERR|...` (not `ERR|WIFI|` or `ERR|RECOVER|`) during a run shows "Run failed" and stops it.
+Cancel goes through a full `FIRMWARE_RESTART` (real MCU reset), not just `CANCEL_PRINT`, because
+`CANCEL_PRINT` alone can't interrupt a macro that's already mid-execution - these protocols use
+large jinja for-loops (e.g. `mix_10` loops 858 times) that, once dispatched, keep running their
+already-queued moves regardless of the sdcard print being "cancelled". Resetting the MCU is the
+only thing that reliably stops it immediately.
+
+`ERR|...` (not `ERR|WIFI|`, `ERR|RECOVER|`, or `ERR|CANCEL|`) during a run shows "Run failed" and stops it.
 Debug echo of what the ESP32 sends (`>> CMD|...`) is compiled out by default
 (`DEBUG_SERIAL_ECHO 0` in `tuna_ui.ino`) since it shares the same `Serial` as the Pi link -
 turn it on only for USB-monitor debugging with nothing driving the bridge.
