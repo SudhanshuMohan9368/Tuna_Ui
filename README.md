@@ -85,18 +85,20 @@ Fields are `|`-separated; SSID/password/error-text fields are percent-encoded (`
 | `CMD\|LIST` | `FILES\|a.gcode;b.gcode;...` | boot, and every time "Choose protocol" opens |
 | `CMD\|PRINT\|<file>` | `RUN\|<file>\|<total_s>\|<steps>\|<desc>`, then `OK\|PRINT` or `ERR\|<msg>` | Start run |
 | (push, ~1/s while printing) | `STATUS\|<state>\|<elapsed_s>\|<step>` | during a run |
-| `CMD\|CANCEL` | `OK\|CANCEL` or `ERR\|CANCEL\|<msg>` | Cancel: `CANCEL_PRINT`, then the same `FIRMWARE_RESTART` -> wait -> `G28` as Recover |
+| `CMD\|CANCEL` | `OK\|CANCEL` or `ERR\|CANCEL\|<msg>` | Cancel: `emergency_stop`, then the same `FIRMWARE_RESTART` -> wait -> `G28` as Recover |
 | `CMD\|ESTOP` | (none - `emergency_stop` is fire-and-forget) | Emergency stop |
 | `CMD\|RECOVER` | `OK\|RECOVER` or `ERR\|RECOVER\|<msg>` | "Back to home" after an E-stop, or "Reset machine" in the Help menu: `FIRMWARE_RESTART`, wait for Klipper `ready`, then `G28` |
 | (push, every 5s) | `WIFI\|1\|<ssid>\|<signal%>\|<ip>` or `WIFI\|0` | always |
 | `CMD\|WIFI_SCAN` | `WIFI_LIST\|ssid,signal,secure;...` | Wi-Fi screen opens/refreshes |
 | `CMD\|WIFI_CONNECT\|<ssid>\|<pass>` | `OK\|WIFI\|<ip>` or `ERR\|WIFI\|<msg>` | choosing a network |
 
-Cancel goes through a full `FIRMWARE_RESTART` (real MCU reset), not just `CANCEL_PRINT`, because
-`CANCEL_PRINT` alone can't interrupt a macro that's already mid-execution - these protocols use
-large jinja for-loops (e.g. `mix_10` loops 858 times) that, once dispatched, keep running their
-already-queued moves regardless of the sdcard print being "cancelled". Resetting the MCU is the
-only thing that reliably stops it immediately.
+Cancel calls `emergency_stop` (`M112`), not `CANCEL_PRINT` - these protocols use large jinja
+for-loops (e.g. `mix_10` loops 858 times), and once one is dispatched, `CANCEL_PRINT` and even
+`FIRMWARE_RESTART` are just normal gcode commands that wait their turn behind the loop's
+already-queued moves instead of actually stopping anything. `emergency_stop` is the one command
+that's genuinely immediate. So Cancel is effectively "E-stop, then auto-recover": halt right now,
+then the same `FIRMWARE_RESTART` -> wait for `ready` -> `G28` sequence as Recover, to bring the
+machine back to a known homed state automatically instead of leaving it shut down.
 
 `ERR|...` (not `ERR|WIFI|`, `ERR|RECOVER|`, or `ERR|CANCEL|`) during a run shows "Run failed" and stops it.
 Debug echo of what the ESP32 sends (`>> CMD|...`) is compiled out by default

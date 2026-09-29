@@ -329,10 +329,18 @@ class Bridge:
         self._restart_and_home("RECOVER")
 
     def do_cancel(self):
+        # print/cancel (CANCEL_PRINT) is a normal gcode command - it still
+        # waits its turn in Klipper's queue behind whatever's already
+        # dispatched, same problem as FIRMWARE_RESTART had before this fix.
+        # For a protocol mid-loop (mix_10 loops 858 times) that means it can
+        # sit queued for a very long time instead of actually cancelling.
+        # emergency_stop (M112) is the one command that's genuinely
+        # immediate - it doesn't wait for the queue at all - so Cancel uses
+        # the same real halt as the E-stop button, then the same recovery.
         try:
-            self.mr.post("/printer/print/cancel")
+            self.mr.post("/printer/emergency_stop")
         except Exception as e:
-            log.warning("print/cancel failed (continuing to restart+home anyway): %s", e)
+            log.warning("emergency_stop for cancel failed: %s", e)
         self.run = None
         self._restart_and_home("CANCEL")
 
